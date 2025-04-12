@@ -1,11 +1,11 @@
 import math
-import requests
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.interpolate import CubicSpline
+import random
 
 ##############################
 # 1. GLOBAL CONSTANTS & SETUP
@@ -17,15 +17,44 @@ AREA_SIZE_KM = 10.0         # 10km x 10km area
 IMAGE_PIXELS = 800          # Increased resolution for smooth movement
 AXIS_MARGIN = 50
 SOLAR_PANEL_SIZE = 25
-NUM_CLOUDS = 8              # Reduced number for better visibility
+MAX_CLOUDS = 25             # Maximum number of clouds in the simulation
 COVERAGE_THRESHOLD = 0.05   # Lower threshold for gradual changes
+
+# Cloud pattern parameters
+CLOUD_PATTERNS = {
+    "SCATTERED": {
+        "probability": 0.5,       # 50% chance of scattered pattern
+        "count_range": (3, 8),    # Few scattered clouds
+        "grouping_factor": 0.2,   # Low grouping (more spread out)
+        "duration": (30, 90)      # How long this pattern lasts (in frames)
+    },
+    "BUNCHED": {
+        "probability": 0.3,       # 30% chance of bunched pattern
+        "count_range": (10, 20),  # Many clouds together
+        "grouping_factor": 0.8,   # High grouping (clouds appear in clusters)
+        "duration": (15, 45)      # Shorter duration for dense clouds
+    },
+    "ISOLATED": {
+        "probability": 0.2,       # 20% chance of isolated pattern
+        "count_range": (1, 3),    # Very few isolated clouds
+        "grouping_factor": 0.1,   # Very low grouping (isolated clouds)
+        "duration": (20, 60)      # Medium duration for this pattern
+    }
+}
 
 # Visual parameters
 BACKGROUND_COLOR = (102, 204, 102)
 PANEL_COLOR = (50, 50, 150)
-CLOUD_BASE_COLOR = (200, 200, 200, 180)
+CLOUD_BASE_COLOR = (255, 255, 255, 180)  # Whiter for cartoon clouds
 CLOUD_OPACITY_RAMP = 0.15   # Opacity change per frame
 CLOUD_SPEED_SCALE = 0.4     # Reduced speed for smoother movement
+
+# Cloud size parameters - SMALLER CLOUDS
+CLOUD_WIDTH_MIN = 40        # Minimum cloud width
+CLOUD_WIDTH_MAX = 80        # Maximum cloud width  
+CLOUD_HEIGHT_MIN = 25       # Minimum cloud height
+CLOUD_HEIGHT_MAX = 50       # Maximum cloud height
+CLOUD_SCALE_FACTOR = 0.5    # Overall scaling factor for cloud rendering
 
 # Solar panel configuration
 panel_names = list("ABCDEFGHIJKLMNOPQRST")
@@ -50,30 +79,53 @@ for i, pname in enumerate(panel_names):
 custom_cloud_factors = {"A": 0.7, "D": 0.65, "K": 0.55, "J": 0.6, "L": 0.6, "G": 0.55}
 cloud_factor_dict = {pname: custom_cloud_factors.get(pname, 0.5) for pname in panel_names}
 
-# Baseline generation data
+# Baseline generation data - create a simple day curve
 time_idx = np.linspace(0, TOTAL_FRAMES - 1, TOTAL_FRAMES)
 baseline_data_dict = {}
 for pname in panel_names:
-    arr = np.array([0.1, 0.2, 0.3])  # Simplified for example
-    if len(arr) != TOTAL_FRAMES:
-        x_old = np.linspace(0, len(arr)-1, len(arr))
-        x_new = np.linspace(0, len(arr)-1, TOTAL_FRAMES)
-        arr = np.interp(x_new, x_old, arr)
-    baseline_data_dict[pname] = CubicSpline(time_idx, arr)
+    # Create a simple diurnal curve with peak at noon
+    hours = np.linspace(0, 24, TOTAL_FRAMES)
+    values = np.sin(np.pi * (hours - 6) / 12) * 0.8  # Peak at noon (hour 12)
+    values = np.clip(values, 0, 1)  # Ensure non-negative values
+    baseline_data_dict[pname] = CubicSpline(time_idx, values)
 
 ##############################
 # 2. ENHANCED CLOUD CLASS
 ##############################
 class Cloud:
-    def __init__(self, birth_frame):
-        self.width = int(np.random.uniform(100, 160))
-        self.height = int(np.random.uniform(60, 100))
-        self.x = np.random.uniform(-self.width, IMAGE_PIXELS)
-        self.y = np.random.uniform(-self.height, IMAGE_PIXELS)
+    def __init__(self, birth_frame, size_factor=1.0, position=None):
+        # Allow variable sizes with a size factor
+        width_min = int(CLOUD_WIDTH_MIN * size_factor)
+        width_max = int(CLOUD_WIDTH_MAX * size_factor)
+        height_min = int(CLOUD_HEIGHT_MIN * size_factor)
+        height_max = int(CLOUD_HEIGHT_MAX * size_factor)
+        
+        # Cloud dimensions with randomness
+        self.width = int(np.random.uniform(width_min, width_max))
+        self.height = int(np.random.uniform(height_min, height_max))
+        
+        # Position - either random or specified (for cloud clusters)
+        if position is None:
+            self.x = np.random.uniform(-self.width, IMAGE_PIXELS)
+            self.y = np.random.uniform(-self.height, IMAGE_PIXELS)
+        else:
+            # Add some variation to the position if it's part of a cluster
+            variation = 50 * size_factor  # More variation for larger clouds
+            self.x = position[0] + np.random.uniform(-variation, variation)
+            self.y = position[1] + np.random.uniform(-variation, variation)
+        
         self.opacity = 0.0
         self.active = False
         self.birth_frame = birth_frame
         self.lifetime = 0
+        
+        # Add randomness for cartoon appearance
+        self.puff_variation = np.random.uniform(0.8, 1.2, 8)  # Random variations for puffs
+        # Add a little rotation for variety
+        self.rotation = np.random.uniform(0, 2*np.pi)
+        # Random cloud color variation (slight blue or gray tint)
+        tint = np.random.randint(0, 20)
+        self.color = (255-tint, 255-tint, 255-max(0, tint-10))
         
     def update(self, dx, dy, frame_idx):
         # Smooth position update with boundary wrapping
@@ -97,54 +149,126 @@ class Cloud:
 # 3. WEATHER DATA & CLOUD SYSTEM
 ##############################
 class WeatherSystem:
-    def __init__(self, date_str):
-        self.cc_hourly, self.wspd_hourly, self.wdir_hourly = self.get_weather_data(date_str)
-        self.cc_5min = self.upsample_to_5min(self.cc_hourly, date_str)[:TOTAL_FRAMES]
-        self.wspd_5min = self.upsample_to_5min(self.wspd_hourly, date_str)[:TOTAL_FRAMES]
-        self.wdir_5min = self.upsample_to_5min(self.wdir_hourly, date_str)[:TOTAL_FRAMES]
-        self.clouds = []
-        self.current_cloud_id = 0
+    def __init__(self):
+        # Generate synthetic weather data
+        # Cloud cover (%)
+        self.cc_hourly = self.generate_synthetic_cloud_cover(24)
+        # Wind speed (m/s)
+        self.wspd_hourly = self.generate_synthetic_wind_speed(24)
+        # Wind direction (degrees)
+        self.wdir_hourly = self.generate_synthetic_wind_direction(24)
         
-    def get_weather_data(self, date_str):
-        base_url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": 35.69,
-            "longitude": 139.69,
-            "hourly": "cloudcover,windspeed_10m,winddirection_10m",
-            "start_date": date_str,
-            "end_date": date_str,
-            "timezone": "auto"
-        }
-        try:
-            resp = requests.get(base_url, params=params, timeout=10)
-            data = resp.json()
-            return (
-                data["hourly"]["cloudcover"],
-                data["hourly"]["windspeed_10m"],
-                data["hourly"]["winddirection_10m"]
-            )
-        except Exception as e:
-            print("API error:", e)
-            return [50.0]*24, [5.0]*24, [270.0]*24
+        # Upsample to 5-minute intervals
+        self.cc_5min = self.upsample_to_5min(self.cc_hourly)
+        self.wspd_5min = self.upsample_to_5min(self.wspd_hourly)
+        self.wdir_5min = self.upsample_to_5min(self.wdir_hourly)
+        
+        self.clouds = []
+        
+        # Cloud pattern control
+        self.current_pattern = "SCATTERED"  # Start with scattered pattern
+        self.pattern_change_frame = 0
+        self.next_pattern_change = random.randint(*CLOUD_PATTERNS["SCATTERED"]["duration"])
+        self.target_cloud_count = random.randint(*CLOUD_PATTERNS["SCATTERED"]["count_range"])
+        
+    def generate_synthetic_cloud_cover(self, hours):
+        # Generate realistic cloud cover pattern with some variation
+        base = 40 + 20 * np.sin(np.linspace(0, 2*np.pi, hours))
+        noise = np.random.normal(0, 10, hours)
+        cc = np.clip(base + noise, 0, 100)
+        return cc
+        
+    def generate_synthetic_wind_speed(self, hours):
+        # Generate wind speed that increases during the day
+        base = 3 + 2 * np.sin(np.linspace(0, 2*np.pi, hours))
+        noise = np.random.normal(0, 0.5, hours)
+        speed = np.clip(base + noise, 0.5, 10)
+        return speed
+        
+    def generate_synthetic_wind_direction(self, hours):
+        # Start with westerly winds (270°) and add gradual rotation
+        base = 270 + 45 * np.sin(np.linspace(0, np.pi, hours))
+        noise = np.random.normal(0, 15, hours)
+        direction = (base + noise) % 360
+        return direction
     
-    def upsample_to_5min(self, arr_hourly, date_str):
-        idx_hourly = pd.date_range(start=date_str, periods=len(arr_hourly), freq="H")
-        idx_5min = pd.date_range(start=date_str, periods=len(arr_hourly)*12, freq="5min")
-        return pd.Series(arr_hourly, index=idx_hourly).reindex(idx_5min).interpolate(method="time").values
+    def upsample_to_5min(self, arr_hourly):
+        # Create a smooth interpolation between hourly values
+        x_hourly = np.arange(len(arr_hourly))
+        x_5min = np.linspace(0, len(arr_hourly)-1, len(arr_hourly)*12)
+        return np.interp(x_5min, x_hourly, arr_hourly)
+    
+    def select_new_pattern(self):
+        # Choose a new cloud pattern based on probabilities
+        r = random.random()
+        cum_prob = 0
+        for pattern, params in CLOUD_PATTERNS.items():
+            cum_prob += params["probability"]
+            if r <= cum_prob:
+                self.current_pattern = pattern
+                break
+        
+        # Set parameters for this pattern
+        pattern_params = CLOUD_PATTERNS[self.current_pattern]
+        self.target_cloud_count = random.randint(*pattern_params["count_range"])
+        self.next_pattern_change = random.randint(*pattern_params["duration"])
+    
+    def create_clouds(self, frame_idx):
+        # Check if it's time to change the pattern
+        if frame_idx - self.pattern_change_frame >= self.next_pattern_change:
+            self.pattern_change_frame = frame_idx
+            self.select_new_pattern()
+            # Print for debugging
+            print(f"Frame {frame_idx}: Changing to {self.current_pattern} pattern, target {self.target_cloud_count} clouds")
+        
+        # Add or remove clouds to match the target count for the current pattern
+        current_count = len(self.clouds)
+        
+        # If we need more clouds, add them according to the pattern
+        if current_count < self.target_cloud_count and current_count < MAX_CLOUDS:
+            pattern_params = CLOUD_PATTERNS[self.current_pattern]
+            grouping_factor = pattern_params["grouping_factor"]
+            
+            # Determine if this should be a new cluster or an addition to existing clouds
+            if random.random() < grouping_factor and current_count > 0:
+                # Add cloud near an existing cloud to create a cluster
+                parent_cloud = random.choice(self.clouds)
+                position = (parent_cloud.x, parent_cloud.y)
+                
+                # Vary the size within clusters
+                size_factor = 0.8 + random.random() * 0.4  # 0.8 to 1.2
+                
+                # Create new cloud near the parent
+                self.clouds.append(Cloud(frame_idx, size_factor, position))
+            else:
+                # Create a completely new cloud with random position
+                size_factor = 0.7 + random.random() * 0.6  # 0.7 to 1.3
+                self.clouds.append(Cloud(frame_idx, size_factor))
     
     def update_clouds(self, frame_idx):
-        if len(self.clouds) < NUM_CLOUDS and frame_idx % 15 == 0:
-            self.clouds.append(Cloud(frame_idx))
+        # First, create or update cloud pattern
+        self.create_clouds(frame_idx)
             
-        # Remove expired clouds
+        # Remove expired clouds or limit to target count
         self.clouds = [c for c in self.clouds if c.lifetime < 3600]
         
-        # Calculate interpolated wind parameters
-        prev_idx = max(0, frame_idx-1)
-        alpha = frame_idx % 1
+        # If we still have too many clouds, remove some of the oldest ones
+        while len(self.clouds) > self.target_cloud_count:
+            # Find the oldest clouds and remove them
+            oldest_idx = 0
+            oldest_lifetime = -1
+            for i, cloud in enumerate(self.clouds):
+                if cloud.lifetime > oldest_lifetime:
+                    oldest_lifetime = cloud.lifetime
+                    oldest_idx = i
+            
+            # Remove the oldest cloud
+            if oldest_idx < len(self.clouds):
+                self.clouds.pop(oldest_idx)
         
-        ws = self.wspd_5min[prev_idx] * (1-alpha) + self.wspd_5min[frame_idx] * alpha
-        wd = self.wdir_5min[prev_idx] * (1-alpha) + self.wdir_5min[frame_idx] * alpha
+        # Calculate current weather parameters
+        ws = self.wspd_5min[min(frame_idx, len(self.wspd_5min)-1)]
+        wd = self.wdir_5min[min(frame_idx, len(self.wdir_5min)-1)]
         
         # Calculate movement vectors
         wd_rad = math.radians(wd)
@@ -173,7 +297,8 @@ def calculate_coverage(panel_pos, clouds, cc_percent):
         distance_x = abs(panel_x - cloud_center_x)
         distance_y = abs(panel_y - cloud_center_y)
         
-        max_dist = max(cloud.width, cloud.height) * 0.7
+        # Adjust coverage calculation for smaller clouds
+        max_dist = max(cloud.width, cloud.height) * 0.6  # Reduced from 0.7
         distance = math.hypot(distance_x, distance_y)
         coverage += np.clip(1 - distance/max_dist, 0, 1) * (cloud.opacity/180)
     
@@ -223,7 +348,7 @@ class VisualizationSystem:
             box = (px-SOLAR_PANEL_SIZE//2, py-SOLAR_PANEL_SIZE//2,
                    px+SOLAR_PANEL_SIZE//2, py+SOLAR_PANEL_SIZE//2)
             d.rectangle(box, fill=PANEL_COLOR)
-            d.text((px, py-SOLAR_PANEL_SIZE//2-15), p['name'], fill=(255,255,255), font=font)
+            d.text((px, py-SOLAR_PANEL_SIZE//2-15), p['name'], fill=(0,0,0), font=font)
         
         return base
     
@@ -241,16 +366,57 @@ class VisualizationSystem:
             if cloud.opacity < 5:
                 continue
                 
-            base_opacity = int(cloud.opacity * 0.8)
-            for i in range(3):
-                offset = i * 4
-                box = (
-                    cloud.x - offset, cloud.y - offset,
-                    cloud.x + cloud.width + offset,
-                    cloud.y + cloud.height + offset
+            # Calculate base opacity for this cloud
+            base_opacity = int(cloud.opacity)
+            cloud_color_with_opacity = cloud.color + (base_opacity,)
+            
+            # Define cloud parameters - SMALLER
+            cloud_center_x = cloud.x + cloud.width/2
+            cloud_center_y = cloud.y + cloud.height/2
+            base_radius = min(cloud.width, cloud.height) * 0.25 * CLOUD_SCALE_FACTOR  # Scale down
+            
+            # Create a cartoon-style cloud with multiple overlapping circles
+            # Main cloud body - a larger central circle
+            main_radius = base_radius * 1.2
+            dd.ellipse(
+                (cloud_center_x - main_radius, cloud_center_y - main_radius,
+                 cloud_center_x + main_radius, cloud_center_y + main_radius),
+                fill=cloud_color_with_opacity
+            )
+            
+            # Add 5-7 smaller "puff" circles around the main circle
+            num_puffs = 5  # Reduced number of puffs for smaller clouds
+            for i in range(num_puffs):
+                # Calculate position around the main circle, with rotation
+                angle = cloud.rotation + (i / num_puffs) * 2 * math.pi
+                distance = base_radius * 0.9
+                puff_x = cloud_center_x + math.cos(angle) * distance
+                puff_y = cloud_center_y + math.sin(angle) * distance
+                
+                # Vary the puff sizes slightly for a more natural look
+                puff_radius = base_radius * (0.6 + 0.3 * (i % 3) / 2) * cloud.puff_variation[i % len(cloud.puff_variation)]
+                
+                dd.ellipse(
+                    (puff_x - puff_radius, puff_y - puff_radius,
+                     puff_x + puff_radius, puff_y + puff_radius),
+                    fill=cloud_color_with_opacity
                 )
-                dd.ellipse(box, fill=(200, 200, 200, int(base_opacity * (0.7**i))))
+            
+            # Add smaller detail puffs - fewer for small clouds
+            for i in range(3):  # Reduced from 4
+                angle = cloud.rotation + ((i + 0.5) / 3) * 2 * math.pi
+                distance = base_radius * 1.3  # Slightly reduced
+                puff_x = cloud_center_x + math.cos(angle) * distance
+                puff_y = cloud_center_y + math.sin(angle) * distance
+                puff_radius = base_radius * 0.4 * cloud.puff_variation[i % len(cloud.puff_variation)]
+                
+                dd.ellipse(
+                    (puff_x - puff_radius, puff_y - puff_radius,
+                     puff_x + puff_radius, puff_y + puff_radius),
+                    fill=cloud_color_with_opacity
+                )
         
+        # Merge the cloud overlay onto the base image
         base_img.paste(overlay, (0, 0), overlay)
     
     def draw_ui(self, img, frame_idx, total_gen, weather):
@@ -262,9 +428,10 @@ class VisualizationSystem:
             f"Time: {timestr}\n"
             f"Cloud Cover: {weather['cc']:.0f}%\n"
             f"Wind: {weather['ws']:.1f}m/s @ {weather['wd']:.0f}°\n"
+            f"Cloud Pattern: {weather['pattern']}\n"
             f"Total Generation: {total_gen:.1f} kW"
         )
-        d.rectangle([10, 10, 220, 130], fill=(0,0,0,128))
+        d.rectangle([10, 10, 220, 150], fill=(0,0,0,128))
         d.text((15, 15), text, fill=(255,255,0), font=self.font)
 
 ##############################
@@ -277,8 +444,7 @@ def get_time_string(frame_idx):
     return f"{hh:02d}:{mm:02d}"
 
 def main():
-    date_str = "2025-04-10"
-    weather_system = WeatherSystem(date_str)
+    weather_system = WeatherSystem()
     viz_system = VisualizationSystem()
     
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -307,10 +473,13 @@ def main():
             py = y1_px - int((p['y_km'] / AREA_SIZE_KM) * axis_length)
             panel_pos = (px + SOLAR_PANEL_SIZE//2, py + SOLAR_PANEL_SIZE//2)
             
+            # Get cloud cover at this time
+            cc_percent = weather_system.cc_5min[min(frame_idx, len(weather_system.cc_5min)-1)]
+            
             coverage = calculate_coverage(
                 panel_pos, 
                 weather_system.clouds,
-                weather_system.cc_5min[frame_idx]
+                cc_percent
             )
             eff_reduction = coverage * cloud_factor_dict[pname]
             final_gen = baseline_val * (1 - eff_reduction)
@@ -320,9 +489,10 @@ def main():
         
         # Draw UI
         weather_data = {
-            'cc': weather_system.cc_5min[frame_idx],
-            'ws': weather_system.wspd_5min[frame_idx],
-            'wd': weather_system.wdir_5min[frame_idx]
+            'cc': weather_system.cc_5min[min(frame_idx, len(weather_system.cc_5min)-1)],
+            'ws': weather_system.wspd_5min[min(frame_idx, len(weather_system.wspd_5min)-1)],
+            'wd': weather_system.wdir_5min[min(frame_idx, len(weather_system.wdir_5min)-1)],
+            'pattern': weather_system.current_pattern
         }
         viz_system.draw_ui(frame_img, frame_idx, total_gen, weather_data)
         
