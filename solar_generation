@@ -1,0 +1,136 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.interpolate import CubicSpline
+from PIL import Image
+import importlib.util
+import os
+import sys
+
+# Directly import the cloud_simulation module from the file
+cloud_sim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud_simulation.py")
+spec = importlib.util.spec_from_file_location("cloud_simulation", cloud_sim_path)
+cloud_simulation = importlib.util.module_from_spec(spec)
+sys.modules["cloud_simulation"] = cloud_simulation
+spec.loader.exec_module(cloud_simulation)
+
+# Now access the components we need
+WeatherSystem = cloud_simulation.WeatherSystem
+VisualizationSystem = cloud_simulation.VisualizationSystem
+calculate_coverage = cloud_simulation.calculate_coverage
+get_time_string = cloud_simulation.get_time_string
+
+# Constants from cloud_simulation
+TOTAL_FRAMES = cloud_simulation.TOTAL_FRAMES
+INTERVAL_MS = cloud_simulation.INTERVAL_MS
+IMAGE_PIXELS = cloud_simulation.IMAGE_PIXELS
+AREA_SIZE_KM = cloud_simulation.AREA_SIZE_KM
+AXIS_MARGIN = cloud_simulation.AXIS_MARGIN
+SOLAR_PANEL_SIZE = cloud_simulation.SOLAR_PANEL_SIZE
+
+##############################
+# SOLAR PANEL CONFIGURATION
+##############################
+panel_names = list("ABCDEFGHIJKLMNOPQRST")
+default_coords = [
+    (8.3, 4.2), (1.6, 9.8), (6.7, 5.1), (9.2, 0.8), (4.5, 7.1),
+    (7.3, 8.6), (0.6, 6.3), (3.9, 2.0), (5.8, 8.4), (3.1, 4.9),
+    (8.2, 9.9), (5.7, 5.6), (2.9, 0.3), (6.4, 7.8), (9.3, 3.9),
+    (5.1, 6.9), (7.0, 9.2), (1.2, 4.6), (9.5, 2.5), (5.1, 1.2),
+]
+custom_coords = {
+    "A": (8.3, 4.2), "D": (9.2, 0.8), "G": (0.6, 6.3),
+    "J": (3.9, 2.0), "K": (0.6, 6.3), "L": (3.1, 4.9)
+}
+panels = []
+for i, pname in enumerate(panel_names):
+    if i >= len(default_coords):
+        break
+    coord = custom_coords.get(pname, default_coords[i])
+    panels.append({'name': pname, 'x_km': coord[0], 'y_km': coord[1]})
+
+# Cloud factors - how much each panel is affected by clouds
+custom_cloud_factors = {"A": 0.7, "D": 0.65, "K": 0.55, "J": 0.6, "L": 0.6, "G": 0.55}
+cloud_factor_dict = {pname: custom_cloud_factors.get(pname, 0.5) for pname in panel_names}
+
+# Create baseline solar generation data - diurnal curve with peak at noon
+time_idx = np.linspace(0, TOTAL_FRAMES - 1, TOTAL_FRAMES)
+baseline_data_dict = {}
+for pname in panel_names:
+    hours = np.linspace(0, 24, TOTAL_FRAMES)
+    values = np.sin(np.pi * (hours - 6) / 12) * 0.8  # Peak at noon (hour 12)
+    values = np.clip(values, 0, 1)  # Ensure non-negative values
+    baseline_data_dict[pname] = CubicSpline(time_idx, values)
+
+##############################
+# MAIN SIMULATION FUNCTION
+##############################
+def main():
+    # Initialize weather and visualization systems
+    weather_system = WeatherSystem()
+    viz_system = VisualizationSystem(panels)
+    
+    # Set up matplotlib figure
+    fig, ax = plt.subplots(figsize=(12, 8))
+    plt.axis("off")
+    im = ax.imshow(np.array(viz_system.base_map), animated=True)
+    
+    # Frame update function
+    def update(frame_idx):
+        if frame_idx >= TOTAL_FRAMES:
+            frame_idx = TOTAL_FRAMES - 1
+        
+        # Update cloud positions based on weather system
+        weather_system.update_clouds(frame_idx)
+        
+        # Create visualization frame
+        frame_img = viz_system.base_map.copy()
+        viz_system.draw_clouds(frame_img, weather_system.clouds)
+        
+        # Calculate solar generation for each panel
+        total_gen = 0
+        panel_generation = {}
+        axis_length = IMAGE_PIXELS - 2 * AXIS_MARGIN
+        x0 = AXIS_MARGIN
+        y1_px = x0 + axis_length
+        
+        for p in panels:
+            pname = p['name']
+            baseline_val = baseline_data_dict[pname](frame_idx)
+            px = x0 + int((p['x_km'] / AREA_SIZE_KM) * axis_length)
+            py = y1_px - int((p['y_km'] / AREA_SIZE_KM) * axis_length)
+            panel_pos = (px + SOLAR_PANEL_SIZE//2, py + SOLAR_PANEL_SIZE//2)
+            
+            # Get cloud cover at this time
+            cc_percent = weather_system.cc_5min[min(frame_idx, len(weather_system.cc_5min)-1)]
+            
+            # Calculate how much cloud coverage affects this panel
+            coverage = calculate_coverage(
+                panel_pos, 
+                weather_system.clouds,
+                cc_percent
+            )
+            
+            # Apply cloud factor (different panels can be affected differently)
+            eff_reduction = coverage * cloud_factor_dict[pname]
+            final_gen = baseline_val * (1 - eff_reduction)
+            
+            panel_generation[pname] = final_gen
+            total_gen += final_gen
+        
+        # Get current weather data for UI display
+        weather_data = weather_system.get_current_weather(frame_idx)
+        
+        # Draw UI with current information
+        viz_system.draw_ui(frame_img, frame_idx, total_gen, weather_data)
+        
+        # Update the display
+        im.set_data(np.array(frame_img))
+        return [im]
+    
+    # Create animation
+    ani = FuncAnimation(fig, update, frames=TOTAL_FRAMES, interval=INTERVAL_MS, blit=False)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
